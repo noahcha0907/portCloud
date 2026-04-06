@@ -1,4 +1,4 @@
-(function() {
+function initParticleCloud() {
   'use strict';
   var CONFIG = {
     instanceCount: 36000, pointSize: 0.1,
@@ -118,8 +118,14 @@
   ].join('\n');
 
   var container = document.getElementById('container');
+  if (!container) { container = document.body; }
+  container.style.width = container.style.width || '100%';
+  container.style.height = container.style.height || '100vh';
+  container.style.position = container.style.position || 'relative';
   var W = container.clientWidth || window.innerWidth;
   var H = container.clientHeight || window.innerHeight;
+  if (W < 10) W = window.innerWidth;
+  if (H < 10) H = window.innerHeight;
   var renderer = new THREE.WebGLRenderer({ alpha: CONFIG.transparentBackground, antialias: false, powerPreference: 'high-performance' });
   renderer.setSize(W, H); renderer.setPixelRatio(CONFIG.pixelRatio);
   renderer.setClearColor(0x000000, CONFIG.transparentBackground ? 0 : 1);
@@ -199,4 +205,9 @@
   }
   animate();
   document.addEventListener('visibilitychange',function(){if(document.hidden){running=false;clock.stop();}else{running=true;clock.start();}});
-})();
+}
+if (document.readyState === 'complete' || document.readyState === 'interactive') {
+  setTimeout(initParticleCloud, 100);
+} else {
+  window.addEventListener('load', initParticleCloud);
+}
