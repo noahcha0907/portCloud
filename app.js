@@ -206,8 +206,19 @@ function initParticleCloud() {
   animate();
   document.addEventListener('visibilitychange',function(){if(document.hidden){running=false;clock.stop();}else{running=true;clock.start();}});
 }
+function tryInit() {
+  if (typeof THREE === 'undefined') {
+    setTimeout(tryInit, 200);
+    return;
+  }
+  if (!document.getElementById('container') && document.readyState !== 'complete') {
+    setTimeout(tryInit, 200);
+    return;
+  }
+  initParticleCloud();
+}
 if (document.readyState === 'complete' || document.readyState === 'interactive') {
-  setTimeout(initParticleCloud, 100);
+  setTimeout(tryInit, 100);
 } else {
-  window.addEventListener('load', initParticleCloud);
+  window.addEventListener('load', tryInit);
 }
