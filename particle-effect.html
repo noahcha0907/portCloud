@@ -1,0 +1,771 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: transparent; }
+    #container { width: 100%; height: 100%; }
+    canvas { display: block; width: 100% !important; height: 100% !important; }
+  </style>
+</head>
+<body>
+  <div id="container"></div>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+  <script>
+  (function() {
+    'use strict';
+
+    // ============================================================
+    // CONFIG — All tunable parameters in one place
+    // ============================================================
+    const CONFIG = {
+      // Geometry
+      instanceCount: 36000,
+      pointSize: 0.1,            // gl_PointSize in pixels
+
+      // Noise — Position (Color Noise TOP) — matched from TD screenshots
+      noisePeriod: 0.62,
+      noiseOctaves: 2,           // TD "Harmonics: 2"
+      noiseAmplitude: 0.51,      // TD "Amplitude: 0.51"
+      harmonicGain: 0.77,        // TD "Harmonic Gain: 0.77"
+      posSpeed: 0.14,            // TD speed
+      exponentMin: 0.15,
+      exponentMax: 4.0,          // TD shows up to ~3.7
+      harmonicSpreadMin: 1.5,
+      harmonicSpreadMax: 10.0,
+
+      // Noise — Scale
+      scaleSpeed: 0.25,
+      scalePeriod: 1.0,
+
+      // Instance spacing in noise field
+      instanceSpread: 0.025,
+
+      // Camera
+      cameraHFOV: 60,
+      cameraNear: 0.1,
+      cameraFar: 1000,
+      cameraZ: 5,
+
+      // Mouse smoothing — lerp factor per frame (0 = no smoothing, 1 = instant)
+      mouseLerp: 0.15,
+
+      // Light (point light at center of particle cloud)
+      lightIntensity: 3.0,
+      lightPosition: [0, 0, 1.5],
+
+      // Post-processing
+      enableRGBDelay: true,
+      rgbDelayFrames: { r: 10, g: 6, b: 2 },
+      historySize: 12,            // Ring buffer depth (must be > max delay)
+      historyResScale: 0.5,      // Half-res history buffers for performance
+      radialBlurStrength: 0.15,
+      radialBlurCenter: [0.5, 0.5],
+      radialBlurSamples: 16,
+      feedbackOpacity: 0.43,
+      feedbackLevelOpacity: 0.5,  // level1: controls trail brightness before add2
+      gamma: 1.0,
+      rgbKeyThreshold: 0.03,
+
+      // Performance
+      pixelRatio: Math.min(window.devicePixelRatio, 2),
+      transparentBackground: true, // true = transparent, false = black
+      whiteBackground: true,       // true = invert colors for white page backgrounds
+    };
+
+    // ============================================================
+    // Mobile / low-end detection
+    // ============================================================
+    const isMobile = navigator.maxTouchPoints > 0;
+    if (isMobile) {
+      CONFIG.enableRGBDelay = false;
+      CONFIG.radialBlurSamples = 6;
+    }
+
+    // ============================================================
+    // GLSL: Simplex 3D Noise (Ashima / Stefan Gustavson)
+    // ============================================================
+    const SIMPLEX_NOISE_GLSL = `
+      vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+      vec4 mod289(vec4 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
+      vec4 permute(vec4 x) { return mod289(((x * 34.0) + 1.0) * x); }
+      vec4 taylorInvSqrt(vec4 r) { return 1.79284291400159 - 0.85373472095314 * r; }
+
+      float snoise(vec3 v) {
+        const vec2 C = vec2(1.0 / 6.0, 1.0 / 3.0);
+        const vec4 D = vec4(0.0, 0.5, 1.0, 2.0);
+
+        vec3 i = floor(v + dot(v, C.yyy));
+        vec3 x0 = v - i + dot(i, C.xxx);
+
+        vec3 g = step(x0.yzx, x0.xyz);
+        vec3 l = 1.0 - g;
+        vec3 i1 = min(g.xyz, l.zxy);
+        vec3 i2 = max(g.xyz, l.zxy);
+
+        vec3 x1 = x0 - i1 + C.xxx;
+        vec3 x2 = x0 - i2 + C.yyy;
+        vec3 x3 = x0 - D.yyy;
+
+        i = mod289(i);
+        vec4 p = permute(permute(permute(
+          i.z + vec4(0.0, i1.z, i2.z, 1.0))
+          + i.y + vec4(0.0, i1.y, i2.y, 1.0))
+          + i.x + vec4(0.0, i1.x, i2.x, 1.0));
+
+        float n_ = 0.142857142857;
+        vec3 ns = n_ * D.wyz - D.xzx;
+
+        vec4 j = p - 49.0 * floor(p * ns.z * ns.z);
+
+        vec4 x_ = floor(j * ns.z);
+        vec4 y_ = floor(j - 7.0 * x_);
+
+        vec4 x = x_ * ns.x + ns.yyyy;
+        vec4 y = y_ * ns.x + ns.yyyy;
+        vec4 h = 1.0 - abs(x) - abs(y);
+
+        vec4 b0 = vec4(x.xy, y.xy);
+        vec4 b1 = vec4(x.zw, y.zw);
+
+        vec4 s0 = floor(b0) * 2.0 + 1.0;
+        vec4 s1 = floor(b1) * 2.0 + 1.0;
+        vec4 sh = -step(h, vec4(0.0));
+
+        vec4 a0 = b0.xzyw + s0.xzyw * sh.xxyy;
+        vec4 a1 = b1.xzyw + s1.xzyw * sh.zzww;
+
+        vec3 p0 = vec3(a0.xy, h.x);
+        vec3 p1 = vec3(a0.zw, h.y);
+        vec3 p2 = vec3(a1.xy, h.z);
+        vec3 p3 = vec3(a1.zw, h.w);
+
+        vec4 norm = taylorInvSqrt(vec4(dot(p0,p0), dot(p1,p1), dot(p2,p2), dot(p3,p3)));
+        p0 *= norm.x; p1 *= norm.y; p2 *= norm.z; p3 *= norm.w;
+
+        vec4 m = max(0.6 - vec4(dot(x0,x0), dot(x1,x1), dot(x2,x2), dot(x3,x3)), 0.0);
+        m = m * m;
+        return 42.0 * dot(m * m, vec4(dot(p0,x0), dot(p1,x1), dot(p2,x2), dot(p3,x3)));
+      }
+    `;
+
+    // ============================================================
+    // GLSL: FBM with harmonic spread and exponent
+    // ============================================================
+    const FBM_GLSL = `
+      float fbm(vec3 p, float spread, float exponent, int octaves, float gain, float amp) {
+        float value = 0.0;
+        float amplitude = amp;
+        float frequency = 1.0;
+        for (int i = 0; i < 4; i++) {
+          if (i >= octaves) break;
+          value += amplitude * snoise(p * frequency);
+          frequency *= spread;
+          amplitude *= gain;
+        }
+        return pow(abs(value), exponent) * sign(value);
+      }
+    `;
+
+    // ============================================================
+    // Particle vertex shader (Points-based)
+    // ============================================================
+    const particleVertexShader = `
+      ${SIMPLEX_NOISE_GLSL}
+      ${FBM_GLSL}
+
+      attribute float aInstanceIndex;
+
+      uniform float uTime;
+      uniform float uPosSpeed;
+      uniform float uScaleSpeed;
+      uniform float uExponent;
+      uniform float uHarmonicSpread;
+      uniform float uNoisePeriod;
+      uniform float uScalePeriod;
+      uniform float uInstanceSpread;
+      uniform float uGridSize;
+      uniform float uPointSize;
+      uniform float uNoiseAmplitude;
+      uniform float uHarmonicGain;
+      uniform int uNoiseOctaves;
+
+      varying float vBrightness;
+
+      // Hash for grid jitter
+      vec2 hash2(vec2 p) {
+        p = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)));
+        return fract(sin(p) * 43758.5453) - 0.5;
+      }
+
+      void main() {
+        float idx = aInstanceIndex;
+        float gx = mod(idx, uGridSize);
+        float gy = floor(idx / uGridSize);
+
+        vec2 jitter = hash2(vec2(gx, gy)) * 0.8;
+        vec2 sampleBase = (vec2(gx, gy) + jitter) * uInstanceSpread / uNoisePeriod;
+
+        float posX = fbm(vec3(sampleBase, uTime * uPosSpeed), uHarmonicSpread, uExponent, uNoiseOctaves, uHarmonicGain, uNoiseAmplitude);
+        float posY = fbm(vec3(sampleBase + vec2(127.1, 311.7), uTime * uPosSpeed), uHarmonicSpread, uExponent, uNoiseOctaves, uHarmonicGain, uNoiseAmplitude);
+        float posZ = fbm(vec3(sampleBase + vec2(269.5, 183.3), uTime * uPosSpeed), uHarmonicSpread, uExponent, uNoiseOctaves, uHarmonicGain, uNoiseAmplitude);
+
+        vec3 pos = vec3(posX, posY, posZ);
+
+        // Point light brightness based on distance from light at origin
+        float dist = length(pos);
+        vBrightness = 1.0 / (1.0 + 0.3 * dist * dist);
+
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(pos, 1.0);
+        gl_PointSize = uPointSize;
+      }
+    `;
+
+    // ============================================================
+    // Particle fragment shader (simple bright dot)
+    // ============================================================
+    const particleFragmentShader = `
+      precision highp float;
+
+      uniform float uLightIntensity;
+      varying float vBrightness;
+
+      void main() {
+        float light = vBrightness * uLightIntensity;
+        gl_FragColor = vec4(vec3(light), 1.0);
+      }
+    `;
+
+    // ============================================================
+    // Post-processing: shared fullscreen vertex shader
+    // ============================================================
+    const fsVertexShader = `
+      varying vec2 vUv;
+      void main() {
+        vUv = uv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `;
+
+    // ============================================================
+    // Post-processing: RGB Delay composite
+    // ============================================================
+    const rgbDelayFragmentShader = `
+      precision highp float;
+      uniform sampler2D tRed;
+      uniform sampler2D tGreen;
+      uniform sampler2D tBlue;
+      varying vec2 vUv;
+      void main() {
+        float r = texture2D(tRed, vUv).r;
+        float g = texture2D(tGreen, vUv).g;
+        float b = texture2D(tBlue, vUv).b;
+        gl_FragColor = vec4(r, g, b, 1.0);
+      }
+    `;
+
+    // ============================================================
+    // Post-processing: Radial Blur
+    // ============================================================
+    const radialBlurFragmentShader = `
+      precision highp float;
+      uniform sampler2D tDiffuse;
+      uniform vec2 uCenter;
+      uniform float uStrength;
+      uniform int uSamples;
+      varying vec2 vUv;
+      void main() {
+        vec2 dir = vUv - uCenter;
+        vec4 color = vec4(0.0);
+        for (int i = 0; i < 24; i++) {
+          if (i >= uSamples) break;
+          float t = float(i) / float(uSamples);
+          color += texture2D(tDiffuse, vUv - dir * t * uStrength);
+        }
+        gl_FragColor = color / float(uSamples);
+      }
+    `;
+
+    // ============================================================
+    // Post-processing: Additive Blend (two inputs)
+    // ============================================================
+    const addBlendFragmentShader = `
+      precision highp float;
+      uniform sampler2D tInput1;
+      uniform sampler2D tInput2;
+      uniform float uBlendWeight;
+      varying vec2 vUv;
+      void main() {
+        vec4 a = texture2D(tInput1, vUv);
+        vec4 b = texture2D(tInput2, vUv);
+        gl_FragColor = a + b * uBlendWeight;
+      }
+    `;
+
+    // ============================================================
+    // Post-processing: Feedback Blend
+    // ============================================================
+    const feedbackBlendFragmentShader = `
+      precision highp float;
+      uniform sampler2D tCurrent;
+      uniform sampler2D tFeedback;
+      uniform float uOpacity;
+      varying vec2 vUv;
+      void main() {
+        // Tone-map input so feedback decay operates on bounded [0,1] values
+        // Without this, overlapping particles create values of 100+ that take
+        // many frames to decay below visibility even with mix blend
+        vec4 current = texture2D(tCurrent, vUv);
+        current.rgb = current.rgb / (1.0 + current.rgb);
+        vec4 prev = texture2D(tFeedback, vUv);
+        gl_FragColor = mix(current, prev, uOpacity);
+      }
+    `;
+
+    // ============================================================
+    // Post-processing: Level pass (opacity/brightness)
+    // ============================================================
+    const levelFragmentShader = `
+      precision highp float;
+      uniform sampler2D tDiffuse;
+      uniform float uOpacity;
+      varying vec2 vUv;
+      void main() {
+        vec4 color = texture2D(tDiffuse, vUv);
+        gl_FragColor = color * uOpacity;
+      }
+    `;
+
+    // ============================================================
+    // Post-processing: Final output (Level + RGBKey combined)
+    // ============================================================
+    const finalFragmentShader = `
+      precision highp float;
+      uniform sampler2D tDiffuse;
+      uniform float uGamma;
+      uniform float uRGBKeyThreshold;
+      varying vec2 vUv;
+      void main() {
+        vec4 color = texture2D(tDiffuse, vUv);
+        // Reinhard tone mapping — compresses HDR values so ghosts actually fade
+        color.rgb = color.rgb / (1.0 + color.rgb);
+        // Gamma correction
+        color.rgb = pow(max(color.rgb, vec3(0.0)), vec3(1.0 / uGamma));
+        // RGB Key: black → transparent
+        float brightness = dot(color.rgb, vec3(0.333));
+        float alpha = smoothstep(0.0, uRGBKeyThreshold, brightness);
+        gl_FragColor = vec4(color.rgb, alpha);
+      }
+    `;
+
+    // ============================================================
+    // Post-processing: Simple copy shader
+    // ============================================================
+    const copyFragmentShader = `
+      precision highp float;
+      uniform sampler2D tDiffuse;
+      varying vec2 vUv;
+      void main() {
+        gl_FragColor = texture2D(tDiffuse, vUv);
+      }
+    `;
+
+    // ============================================================
+    // SETUP
+    // ============================================================
+    const container = document.getElementById('container');
+    let W = container.clientWidth || window.innerWidth;
+    let H = container.clientHeight || window.innerHeight;
+
+    // Renderer
+    const renderer = new THREE.WebGLRenderer({
+      alpha: CONFIG.transparentBackground,
+      antialias: false,
+      powerPreference: 'high-performance',
+    });
+    renderer.setSize(W, H);
+    renderer.setPixelRatio(CONFIG.pixelRatio);
+    renderer.setClearColor(0x000000, CONFIG.transparentBackground ? 0 : 1);
+    renderer.autoClear = false;
+    container.appendChild(renderer.domElement);
+    if (CONFIG.whiteBackground) {
+      renderer.domElement.style.filter = 'invert(1)';
+    }
+
+    // Low-end detection
+    const isLowEnd = !renderer.capabilities.floatFragmentTextures
+                  || renderer.capabilities.maxTextureSize < 4096;
+    if (isLowEnd) {
+      CONFIG.enableRGBDelay = false;
+      CONFIG.radialBlurSamples = 6;
+    }
+
+    // Camera (convert horizontal FOV to vertical FOV)
+    function hfovToVfov(hfov, aspect) {
+      return 2 * Math.atan(Math.tan((hfov * Math.PI / 180) / 2) / aspect) * 180 / Math.PI;
+    }
+    const vFOV = hfovToVfov(CONFIG.cameraHFOV, W / H);
+    const camera = new THREE.PerspectiveCamera(vFOV, W / H, CONFIG.cameraNear, CONFIG.cameraFar);
+    camera.position.z = CONFIG.cameraZ;
+
+    // Scene
+    const scene = new THREE.Scene();
+
+    // ============================================================
+    // POINT CLOUD PARTICLES
+    // ============================================================
+    const geometry = new THREE.BufferGeometry();
+    const positions = new Float32Array(CONFIG.instanceCount * 3); // all at origin
+    const indices = new Float32Array(CONFIG.instanceCount);
+    for (let i = 0; i < CONFIG.instanceCount; i++) indices[i] = i;
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('aInstanceIndex', new THREE.BufferAttribute(indices, 1));
+
+    // Particle uniforms
+    const particleUniforms = {
+      uTime:            { value: 0.0 },
+      uPosSpeed:        { value: CONFIG.posSpeed },
+      uScaleSpeed:      { value: CONFIG.scaleSpeed },
+      uExponent:        { value: CONFIG.exponentMin },
+      uHarmonicSpread:  { value: CONFIG.harmonicSpreadMin },
+      uNoisePeriod:     { value: CONFIG.noisePeriod },
+      uScalePeriod:     { value: CONFIG.scalePeriod },
+      uInstanceSpread:  { value: CONFIG.instanceSpread },
+      uGridSize:        { value: Math.ceil(Math.sqrt(CONFIG.instanceCount)) },
+      uPointSize:       { value: CONFIG.pointSize },
+      uNoiseAmplitude:  { value: CONFIG.noiseAmplitude },
+      uHarmonicGain:    { value: CONFIG.harmonicGain },
+      uNoiseOctaves:    { value: CONFIG.noiseOctaves },
+      uLightIntensity:  { value: CONFIG.lightIntensity },
+    };
+
+    const particleMaterial = new THREE.ShaderMaterial({
+      uniforms: particleUniforms,
+      vertexShader: particleVertexShader,
+      fragmentShader: particleFragmentShader,
+      transparent: true,
+      depthTest: false,
+      depthWrite: false,
+    });
+
+    const particlePoints = new THREE.Points(geometry, particleMaterial);
+    scene.add(particlePoints);
+
+    // ============================================================
+    // RENDER TARGETS
+    // ============================================================
+    function createRT(w, h, opts) {
+      return new THREE.WebGLRenderTarget(w, h, Object.assign({
+        type: THREE.HalfFloatType,
+        format: THREE.RGBAFormat,
+        minFilter: THREE.LinearFilter,
+        magFilter: THREE.LinearFilter,
+        stencilBuffer: false,
+        depthBuffer: false,
+      }, opts || {}));
+    }
+
+    // History ring buffer for RGB delay
+    const historyW = Math.floor(W * CONFIG.historyResScale);
+    const historyH = Math.floor(H * CONFIG.historyResScale);
+    let historyTargets = [];
+    if (CONFIG.enableRGBDelay) {
+      for (let i = 0; i < CONFIG.historySize; i++) {
+        historyTargets.push(createRT(historyW, historyH));
+      }
+    }
+
+    // Intermediate render targets
+    let rgbDelayRT     = createRT(W, H);
+    let radialBlurRT   = createRT(W, H);
+    let add1RT         = createRT(W, H);
+    let feedbackA      = createRT(W, H);
+    let feedbackB      = createRT(W, H);
+    let feedbackRead   = feedbackA;
+    let feedbackWrite  = feedbackB;
+    let level1RT       = createRT(W, H);
+    let add2RT         = createRT(W, H);
+
+    // Clear feedback buffers to prevent garbage on first frames
+    renderer.setRenderTarget(feedbackA);
+    renderer.clear();
+    renderer.setRenderTarget(feedbackB);
+    renderer.clear();
+    renderer.setRenderTarget(null);
+
+    // ============================================================
+    // POST-PROCESSING MATERIALS
+    // ============================================================
+    function createPassMaterial(fragmentShader, uniforms) {
+      return new THREE.ShaderMaterial({
+        uniforms: uniforms,
+        vertexShader: fsVertexShader,
+        fragmentShader: fragmentShader,
+        depthTest: false,
+        depthWrite: false,
+        blending: THREE.NoBlending,  // CRITICAL: disable alpha blending for intermediate passes
+      });
+    }
+
+    // RGB Delay
+    const rgbDelayMaterial = createPassMaterial(rgbDelayFragmentShader, {
+      tRed:   { value: null },
+      tGreen: { value: null },
+      tBlue:  { value: null },
+    });
+
+    // Radial Blur
+    const radialBlurMaterial = createPassMaterial(radialBlurFragmentShader, {
+      tDiffuse:  { value: null },
+      uCenter:   { value: new THREE.Vector2(...CONFIG.radialBlurCenter) },
+      uStrength: { value: CONFIG.radialBlurStrength },
+      uSamples:  { value: CONFIG.radialBlurSamples },
+    });
+
+    // Additive Blend
+    const addBlendMaterial = createPassMaterial(addBlendFragmentShader, {
+      tInput1: { value: null },
+      tInput2: { value: null },
+      uBlendWeight: { value: 0.5 },
+    });
+
+    // Feedback Blend
+    const feedbackBlendMaterial = createPassMaterial(feedbackBlendFragmentShader, {
+      tCurrent:  { value: null },
+      tFeedback: { value: null },
+      uOpacity:  { value: CONFIG.feedbackOpacity },
+    });
+
+    // Level1 (feedback trail brightness)
+    const level1Material = createPassMaterial(levelFragmentShader, {
+      tDiffuse:  { value: null },
+      uOpacity:  { value: CONFIG.feedbackLevelOpacity },
+    });
+
+    // Add2 (fresh add1 + attenuated feedback trails)
+    const add2BlendMaterial = createPassMaterial(addBlendFragmentShader, {
+      tInput1: { value: null },
+      tInput2: { value: null },
+      uBlendWeight: { value: 1.0 },
+    });
+
+    // Final (Level2 + RGBKey) — needs blending for transparent background
+    const finalMaterial = createPassMaterial(finalFragmentShader, {
+      tDiffuse:          { value: null },
+      uGamma:            { value: CONFIG.gamma },
+      uRGBKeyThreshold:  { value: CONFIG.rgbKeyThreshold },
+    });
+    if (CONFIG.transparentBackground) {
+      finalMaterial.blending = THREE.NormalBlending;
+      finalMaterial.transparent = true;
+    }
+
+    // Copy (for rendering scene to history when RGB delay disabled path needs it)
+    const copyMaterial = createPassMaterial(copyFragmentShader, {
+      tDiffuse: { value: null },
+    });
+
+    // ============================================================
+    // FULLSCREEN QUAD HELPER
+    // ============================================================
+    const fsCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+    const fsGeometry = new THREE.PlaneGeometry(2, 2);
+    const fsScene = new THREE.Scene();
+    const fsMesh = new THREE.Mesh(fsGeometry);
+    fsScene.add(fsMesh);
+
+    function renderQuad(material, target) {
+      fsMesh.material = material;
+      renderer.setRenderTarget(target);
+      renderer.render(fsScene, fsCamera);
+    }
+
+    // ============================================================
+    // MOUSE INTERACTION
+    // ============================================================
+    function remap(value, inMin, inMax, outMin, outMax) {
+      return outMin + ((value - inMin) / (inMax - inMin)) * (outMax - outMin);
+    }
+
+    // Smoothed mouse targets (lerp toward these each frame)
+    var targetExponent = CONFIG.exponentMin;
+    var targetHarmonicSpread = CONFIG.harmonicSpreadMin;
+
+    function handlePointer(clientX, clientY) {
+      // Normalize to -1..1
+      const txNorm = (clientX / W) * 2 - 1;
+      const tyNorm = -((clientY / H) * 2 - 1);
+
+      // Exponent: center & left = min (wide cloud), right edge = max (tight cloud)
+      const tX = Math.max(0, Math.min(1, txNorm));
+      targetExponent = remap(tX, 0, 1, CONFIG.exponentMin, CONFIG.exponentMax);
+
+      // Harmonic Spread: center & bottom = min (smooth), top = max (complex)
+      const tY = Math.max(0, Math.min(1, tyNorm));
+      targetHarmonicSpread = remap(tY, 0, 1, CONFIG.harmonicSpreadMin, CONFIG.harmonicSpreadMax);
+    }
+
+    window.addEventListener('mousemove', function(e) {
+      handlePointer(e.clientX, e.clientY);
+    });
+
+    if (isMobile) {
+      window.addEventListener('touchmove', function(e) {
+        if (e.touches.length > 0) {
+          handlePointer(e.touches[0].clientX, e.touches[0].clientY);
+        }
+      }, { passive: true });
+    }
+
+    // ============================================================
+    // RESIZE
+    // ============================================================
+    function onResize(width, height) {
+      W = width;
+      H = height;
+      renderer.setSize(W, H);
+      renderer.setPixelRatio(CONFIG.pixelRatio);
+
+      // Update camera
+      const newVFOV = hfovToVfov(CONFIG.cameraHFOV, W / H);
+      camera.fov = newVFOV;
+      camera.aspect = W / H;
+      camera.updateProjectionMatrix();
+
+      // Resize render targets
+      rgbDelayRT.setSize(W, H);
+      radialBlurRT.setSize(W, H);
+      add1RT.setSize(W, H);
+      feedbackA.setSize(W, H);
+      feedbackB.setSize(W, H);
+      level1RT.setSize(W, H);
+      add2RT.setSize(W, H);
+
+      if (CONFIG.enableRGBDelay) {
+        const hW = Math.floor(W * CONFIG.historyResScale);
+        const hH = Math.floor(H * CONFIG.historyResScale);
+        historyTargets.forEach(function(t) { t.setSize(hW, hH); });
+      }
+    }
+
+    const ro = new ResizeObserver(function(entries) {
+      for (let i = 0; i < entries.length; i++) {
+        const rect = entries[i].contentRect;
+        if (rect.width > 0 && rect.height > 0) {
+          onResize(rect.width, rect.height);
+        }
+      }
+    });
+    ro.observe(container);
+
+    // ============================================================
+    // ANIMATION LOOP
+    // ============================================================
+    const clock = new THREE.Clock();
+    let frameIndex = 0;
+    let running = true;
+
+    function animate() {
+      if (!running) {
+        requestAnimationFrame(animate);
+        return;
+      }
+      requestAnimationFrame(animate);
+
+      const elapsed = clock.getElapsedTime();
+      particleUniforms.uTime.value = elapsed;
+
+      // Smooth mouse input
+      var lerpFactor = CONFIG.mouseLerp;
+      particleUniforms.uExponent.value += (targetExponent - particleUniforms.uExponent.value) * lerpFactor;
+      particleUniforms.uHarmonicSpread.value += (targetHarmonicSpread - particleUniforms.uHarmonicSpread.value) * lerpFactor;
+
+      // ------- Step 1: Render scene -------
+      if (CONFIG.enableRGBDelay) {
+        // Render to current history slot
+        const currentSlot = frameIndex % CONFIG.historySize;
+        renderer.setRenderTarget(historyTargets[currentSlot]);
+        renderer.setClearColor(0x000000, 0);
+        renderer.clear();
+        renderer.render(scene, camera);
+
+        // During warm-up, clamp delay indices to available frames
+        var maxDelay = Math.min(frameIndex, CONFIG.historySize - 1);
+        var rDelay = Math.min(CONFIG.rgbDelayFrames.r, maxDelay);
+        var gDelay = Math.min(CONFIG.rgbDelayFrames.g, maxDelay);
+        var bDelay = Math.min(CONFIG.rgbDelayFrames.b, maxDelay);
+
+        var rIdx = ((frameIndex - rDelay) % CONFIG.historySize + CONFIG.historySize) % CONFIG.historySize;
+        var gIdx = ((frameIndex - gDelay) % CONFIG.historySize + CONFIG.historySize) % CONFIG.historySize;
+        var bIdx = ((frameIndex - bDelay) % CONFIG.historySize + CONFIG.historySize) % CONFIG.historySize;
+
+        rgbDelayMaterial.uniforms.tRed.value   = historyTargets[rIdx].texture;
+        rgbDelayMaterial.uniforms.tGreen.value = historyTargets[gIdx].texture;
+        rgbDelayMaterial.uniforms.tBlue.value  = historyTargets[bIdx].texture;
+        renderQuad(rgbDelayMaterial, rgbDelayRT);
+      } else {
+        // No RGB delay — render scene directly to rgbDelayRT
+        renderer.setRenderTarget(rgbDelayRT);
+        renderer.setClearColor(0x000000, 0);
+        renderer.clear();
+        renderer.render(scene, camera);
+      }
+
+      // ------- Step 2: Radial blur -------
+      radialBlurMaterial.uniforms.tDiffuse.value = rgbDelayRT.texture;
+      renderQuad(radialBlurMaterial, radialBlurRT);
+
+      // ------- Step 3: Add (rgbDelay + radialBlur) -------
+      addBlendMaterial.uniforms.tInput1.value = rgbDelayRT.texture;
+      addBlendMaterial.uniforms.tInput2.value = radialBlurRT.texture;
+      renderQuad(addBlendMaterial, add1RT);
+
+      // ------- Step 4: Feedback (add1 → persistent buffer) -------
+      feedbackBlendMaterial.uniforms.tCurrent.value  = add1RT.texture;
+      feedbackBlendMaterial.uniforms.tFeedback.value = feedbackRead.texture;
+      feedbackBlendMaterial.uniforms.uOpacity.value  = CONFIG.feedbackOpacity;
+      renderQuad(feedbackBlendMaterial, feedbackWrite);
+
+      // Swap feedback buffers
+      var temp = feedbackRead;
+      feedbackRead = feedbackWrite;
+      feedbackWrite = temp;
+
+      // ------- Step 5: Level1 (attenuate feedback trail brightness) -------
+      level1Material.uniforms.tDiffuse.value = feedbackRead.texture;
+      renderQuad(level1Material, level1RT);
+
+      // ------- Step 6: Add2 (fresh add1 + attenuated trails) -------
+      add2BlendMaterial.uniforms.tInput1.value = add1RT.texture;
+      add2BlendMaterial.uniforms.tInput2.value = level1RT.texture;
+      renderQuad(add2BlendMaterial, add2RT);
+
+      // ------- Step 7: Final output (Level2 + RGBKey) → screen -------
+      finalMaterial.uniforms.tDiffuse.value = add2RT.texture;
+      renderQuad(finalMaterial, null);
+
+      frameIndex++;
+    }
+
+    animate();
+
+    // ============================================================
+    // VISIBILITY — pause when tab is hidden
+    // ============================================================
+    document.addEventListener('visibilitychange', function() {
+      if (document.hidden) {
+        running = false;
+        clock.stop();
+      } else {
+        running = true;
+        clock.start();
+      }
+    });
+
+  })();
+  </script>
+</body>
+</html>
